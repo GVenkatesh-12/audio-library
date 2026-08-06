@@ -33,9 +33,12 @@ modules:
   - name: audio-library
     buildsystem: simple
     # The flatpak build sandbox has no network by default; cargo needs it to
-    # fetch Rust crates from crates.io.
+    # fetch Rust crates from crates.io. The rust-stable SDK extension is
+    # mounted at /usr/lib/sdk/rust-stable but its bin/ is NOT added to the
+    # sandbox PATH automatically, so we append it here.
     build-options:
       network: true
+      append-path: /usr/lib/sdk/rust-stable/bin
     build-commands:
       - cargo build --release --locked
       - install -Dm755 target/release/audio-library /app/bin/audio-library
