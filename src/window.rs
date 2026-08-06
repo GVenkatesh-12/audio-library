@@ -680,7 +680,7 @@ impl Window {
             }
             let dragging = state
                 .last_interaction
-                .map_or(false, |t| t.elapsed() < Duration::from_millis(DRAG_GRACE_MS));
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(DRAG_GRACE_MS));
             if !dragging && position > 0 {
                 self.ui.position_scale.set_value(position as f64);
             }

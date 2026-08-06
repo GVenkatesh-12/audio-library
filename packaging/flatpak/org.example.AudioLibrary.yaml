@@ -23,6 +23,11 @@ finish-args:
   - --socket=wayland
   - --socket=fallback-x11
   - --device=dri
+  # The status-notifier indicator (top-bar tray icon) registers with
+  # org.kde.StatusNotifierWatcher on the session bus. Without full session
+  # bus access the sandbox's D-Bus proxy only exposes portal services and
+  # the registration call fails, so the tray icon never appears.
+  - --socket=session-bus
   - --socket=pulseaudio
   # The library stores absolute paths to your audio files in SQLite and
   # plays those paths directly. For a personal app the simplest, most

@@ -47,9 +47,21 @@ pub fn run() -> glib::ExitCode {
     // keeps the tray icon working there (flatpak sets `FLATPAK_ID`).
     let tray = LibraryTray::new(command_tx);
     let tray_handle = if std::env::var("FLATPAK_ID").is_ok() {
-        tray.disable_dbus_name(true).spawn().ok()
+        match tray.disable_dbus_name(true).spawn() {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                eprintln!("tray: failed to register in flatpak sandbox: {error:?}");
+                None
+            }
+        }
     } else {
-        tray.spawn().ok()
+        match tray.spawn() {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                eprintln!("tray: failed to register: {error:?}");
+                None
+            }
+        }
     };
 
     app.connect_activate(move |app| {

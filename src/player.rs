@@ -55,6 +55,9 @@ pub enum PlayerEvent {
 pub struct Player {
     playbin: Option<gstreamer::Element>,
     state: Arc<Mutex<PlaybackState>>,
+    /// Keeps the bus watch installed; dropping it removes the watch and
+    /// would silently break end-of-stream / error delivery.
+    _bus_watch: Option<Arc<gstreamer::bus::BusWatchGuard>>,
 }
 
 const ONE_SECOND_NS: u64 = 1_000_000_000;
@@ -81,26 +84,37 @@ impl Player {
             .bus()
             .ok_or_else(|| PlayerError::Init("playbin has no bus".into()))?;
         let state_clone = Arc::clone(&state);
-        bus.connect_message(None, move |_bus, message| match message.type_() {
-            gstreamer::MessageType::Eos => {
-                *state_clone.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                    PlaybackState::Stopped;
-                let _ = events.unbounded_send(PlayerEvent::EndOfStream);
-            }
-            gstreamer::MessageType::Error => {
-                if let gstreamer::MessageView::Error(error) = message.view() {
-                    *state_clone.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                        PlaybackState::Stopped;
-                    let _ = events
-                        .unbounded_send(PlayerEvent::Error(error.error().to_string()));
+        // A bus *watch* must be installed for messages to be dispatched at
+        // all: `connect_message` only wires up the `message` signal, which
+        // GStreamer emits solely when a watch source pops messages from the
+        // bus. Without `add_watch` the pipeline posts messages that never
+        // reach this callback (end-of-stream, errors).
+        let watch = bus
+            .add_watch(move |_bus, message| {
+                match message.type_() {
+                    gstreamer::MessageType::Eos => {
+                        *state_clone.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            PlaybackState::Stopped;
+                        let _ = events.unbounded_send(PlayerEvent::EndOfStream);
+                    }
+                    gstreamer::MessageType::Error => {
+                        if let gstreamer::MessageView::Error(error) = message.view() {
+                            *state_clone.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                PlaybackState::Stopped;
+                            let _ = events
+                                .unbounded_send(PlayerEvent::Error(error.error().to_string()));
+                        }
+                    }
+                    _ => {}
                 }
-            }
-            _ => {}
-        });
+                glib::ControlFlow::Continue
+            })
+            .map_err(|error| PlayerError::Init(format!("could not watch the bus: {error}")))?;
 
         Ok(Self {
             playbin: Some(playbin),
             state,
+            _bus_watch: Some(Arc::new(watch)),
         })
     }
 
@@ -111,6 +125,7 @@ impl Player {
         Self {
             playbin: None,
             state: Arc::new(Mutex::new(PlaybackState::Stopped)),
+            _bus_watch: None,
         }
     }
 
@@ -280,5 +295,64 @@ mod tests {
         assert_eq!(player.state(), PlaybackState::Stopped);
         assert_eq!(player.position(), 0);
         assert_eq!(player.duration(), 0);
+    }
+
+    #[test]
+    fn end_of_stream_returns_to_stopped_and_emits_event() {
+        init_gstreamer();
+        let wav = std::env::temp_dir().join("audio-library-test-eos.wav");
+        let samples_per_second = 8000u32;
+        let seconds = 3u32;
+        let samples = (samples_per_second * seconds) as usize;
+        let mut data = Vec::with_capacity(samples * 2);
+        for i in 0..samples {
+            let value = (8000f32 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / samples_per_second as f32).sin()) as i16;
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        // Minimal mono 16-bit PCM WAV file.
+        let mut header = Vec::new();
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        header.extend_from_slice(b"WAVE");
+        header.extend_from_slice(b"fmt ");
+        header.extend_from_slice(&16u32.to_le_bytes());
+        header.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        header.extend_from_slice(&1u16.to_le_bytes()); // mono
+        header.extend_from_slice(&samples_per_second.to_le_bytes());
+        header.extend_from_slice(&(samples_per_second * 2).to_le_bytes()); // byte rate
+        header.extend_from_slice(&2u16.to_le_bytes()); // block align
+        header.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        header.extend_from_slice(b"data");
+        header.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        std::fs::write(&wav, header.into_iter().chain(data).collect::<Vec<_>>())
+            .expect("write test wav");
+        let uri = format!("file://{}", wav.display());
+
+        let (sender, mut receiver) = futures_channel::mpsc::unbounded();
+        let player = Player::new(sender).expect("player should initialize");
+        player.play_uri(&uri);
+        assert_eq!(player.state(), PlaybackState::Playing);
+
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut eos_received = false;
+        while std::time::Instant::now() < deadline {
+            while let Ok(event) = receiver.try_recv() {
+                if matches!(event, PlayerEvent::EndOfStream) {
+                    eos_received = true;
+                }
+            }
+            if eos_received && player.state() == PlaybackState::Stopped {
+                break;
+            }
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(eos_received, "EndOfStream event was never emitted");
+        assert_eq!(
+            player.state(),
+            PlaybackState::Stopped,
+            "player must clear its state when the stream ends"
+        );
     }
 }
