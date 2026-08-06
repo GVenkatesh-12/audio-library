@@ -1,0 +1,26 @@
+[package]
+name = "audio-library"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight personal audio library for GNOME"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+gtk4 = { version = "0.11", features = ["v4_10", "v4_14"] }
+libadwaita = { version = "0.9", features = ["v1_2", "v1_5"] }
+glib = "0.22"
+gstreamer = "0.25"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+futures-util = "0.3"
+futures-channel = "0.3"
+
+[dev-dependencies]
+serde_json = "1"
+
+[build-dependencies]
+glib-build-tools = "0.22"
+
+[profile.release]
+lto = true
+strip = true

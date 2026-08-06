@@ -1,0 +1,6 @@
+/* Audio Library – minimal custom styling.
+
+   The application deliberately relies on libadwaita's default theme for
+   nearly everything: widgets, colors, spacing and automatic light/dark
+   switching. Rules here should only exist when a genuinely custom touch is
+   required; prefer default widgets over custom CSS. */
