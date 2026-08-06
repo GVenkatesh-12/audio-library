@@ -1,0 +1,44 @@
+# Audio Library – Flatpak manifest
+#
+# Built with:
+#   ./packaging/flatpak/build-flatpak.sh
+#
+# The source is staged by the build script into packaging/flatpak/src-stage/
+# (a tarball-style copy that excludes target/ and .git), which keeps the
+# flatpak build fast. Do not run flatpak-builder directly without staging.
+
+app-id: org.example.AudioLibrary
+runtime: org.gnome.Platform
+runtime-version: "48"
+sdk: org.gnome.Sdk
+command: audio-library
+
+finish-args:
+  # Standard desktop app access.
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --socket=pulseaudio
+  # The library stores absolute paths to your audio files in SQLite and
+  # plays those paths directly. For a personal app the simplest, most
+  # reliable choice is access to the user's home directory.
+  - --filesystem=host
+
+modules:
+  - name: audio-library
+    buildsystem: simple
+    # The flatpak build sandbox has no network by default; cargo needs it to
+    # fetch Rust crates from crates.io.
+    build-options:
+      network: true
+    build-commands:
+      - cargo build --release --locked
+      - install -Dm755 target/release/audio-library /app/bin/audio-library
+      - install -Dm644 packaging/flatpak/assets/audio-library.png /app/share/icons/hicolor/512x512/apps/org.example.AudioLibrary.png
+      - install -Dm644 packaging/flatpak/assets/org.example.AudioLibrary.desktop /app/share/applications/org.example.AudioLibrary.desktop
+      - install -Dm644 packaging/flatpak/assets/org.example.AudioLibrary.appdata.xml /app/share/metainfo/org.example.AudioLibrary.appdata.xml
+    sources:
+      - type: dir
+        path: src-stage
+        dest: .

@@ -38,6 +38,21 @@ an **autostart entry** (`~/.config/autostart/audio-library.desktop`) so the
 tray icon appears automatically after login. Add `--no-autostart` to skip the
 login autostart.
 
+## Building a Flatpak (easiest install on Ubuntu)
+
+```bash
+sudo apt install flatpak-builder
+./packaging/flatpak/build-flatpak.sh      # builds, bundles and installs
+```
+
+Drop your app icon into `packaging/flatpak/logo/` as `logo.png` (512x512 PNG)
+before building and it is used as the app icon automatically.
+
+On the first run the GNOME runtime + SDK are downloaded from Flathub. The
+resulting `org.example.AudioLibrary.flatpak` bundle can be installed on any
+Ubuntu machine with `flatpak install --user <bundle>`. Pass `--no-install` to
+only build the bundle.
+
 ## Running
 
 ```bash

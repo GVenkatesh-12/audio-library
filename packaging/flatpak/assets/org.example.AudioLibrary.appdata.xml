@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.example.AudioLibrary</id>
+  <name>Audio Library</name>
+  <summary>Play your personal audio collection</summary>
+  <developer_name>Audio Library</developer_name>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <description>
+    <p>A lightweight personal audio collection for GNOME. Store references to your MP3 files, give them titles, and play them from the main window or straight from a top-bar system icon.</p>
+  </description>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Music</category>
+    <category>Player</category>
+  </categories>
+  <launchable type="desktop-id">org.example.AudioLibrary.desktop</launchable>
+  <releases>
+    <release version="0.1.0" date="2026-08-06"/>
+  </releases>
+</component>
