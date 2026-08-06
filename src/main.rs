@@ -8,6 +8,7 @@ mod app;
 mod database;
 mod models;
 mod player;
+mod tray;
 mod ui;
 mod window;
 

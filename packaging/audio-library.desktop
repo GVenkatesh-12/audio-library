@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Audio Library
+GenericName=Audio Player
+Comment=Play your personal audio collection from the system tray
+Exec=audio-library
+Icon=audio-library
+Terminal=false
+Categories=AudioVideo;Audio;Music;Player;
+Keywords=music;audio;play;
+StartupNotify=true

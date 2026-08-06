@@ -31,8 +31,12 @@ use libadwaita::prelude::*;
 use crate::database::{Database, Event};
 use crate::models::AudioEntry;
 use crate::player::{PlaybackState, Player, PlayerEvent};
+use crate::tray::{LibraryTray, TrayCommand, TrayStatus};
 use crate::ui::dialogs;
 use crate::ui::EntryListPopover;
+
+/// Type alias for the status-notifier indicator handle.
+type TrayHandle = ksni::blocking::Handle<LibraryTray>;
 
 /// How often the UI refreshes playback position and state.
 const POSITION_REFRESH_MS: u64 = 500;
@@ -55,6 +59,9 @@ struct AppState {
     last_duration: u64,
     /// When the user last moved the position slider.
     last_interaction: Option<Instant>,
+    /// Playback state signature last pushed to the tray, so we only rebuild
+    /// its menu when something actually changed.
+    last_tray_sync: Option<(Option<i64>, bool, bool)>,
 }
 
 /// All widgets the window needs to address.
@@ -70,20 +77,32 @@ struct Ui {
     stop_button: gtk4::Button,
     toast_overlay: libadwaita::ToastOverlay,
     popover: EntryListPopover,
+    /// List of saved entries shown in the main window, with delete buttons.
+    library_list: gtk4::ListBox,
 }
 
 /// The application window. Widgets, database handle, player and state.
 pub struct Window {
     pub window: libadwaita::ApplicationWindow,
+    /// Owning application, stored so we can quit even when the window has
+    /// never been shown (background/tray-only mode makes `window.application()`
+    /// return `None`).
+    app: libadwaita::Application,
     database: Database,
     player: Player,
     state: Rc<RefCell<AppState>>,
     ui: Ui,
+    /// Handle to the status-notifier indicator, if it could be started.
+    tray: Option<TrayHandle>,
 }
 
 impl Window {
     /// Build the full window: widget tree, signals, background services.
-    pub fn new(app: &libadwaita::Application) -> Rc<Self> {
+    pub fn new(
+        app: &libadwaita::Application,
+        tray_commands: UnboundedReceiver<TrayCommand>,
+        tray: Option<TrayHandle>,
+    ) -> Rc<Self> {
         let window = libadwaita::ApplicationWindow::builder()
             .application(app)
             .title("Audio Library")
@@ -112,18 +131,25 @@ impl Window {
 
         let window = Rc::new(Self {
             window,
+            app: app.clone(),
             database,
             player,
             state: Rc::new(RefCell::new(AppState::default())),
             ui,
+            tray,
         });
 
-        window.setup(player_events_rx, db_events);
+        window.setup(player_events_rx, db_events, tray_commands);
         window
     }
 
     /// Connect all signals and start background updates.
-    fn setup(self: &Rc<Self>, player_events: UnboundedReceiver<PlayerEvent>, db_events: UnboundedReceiver<Event>) {
+    fn setup(
+        self: &Rc<Self>,
+        player_events: UnboundedReceiver<PlayerEvent>,
+        db_events: UnboundedReceiver<Event>,
+        tray_commands: UnboundedReceiver<TrayCommand>,
+    ) {
         // --- Add-audio form ------------------------------------------------
         {
             let weak = Rc::downgrade(self);
@@ -153,7 +179,11 @@ impl Window {
                 this.on_choose_file(&choose_inner);
             });
         }
-        // The whole "Audio File" row acts as a button.
+        // The whole "Audio File" row acts as a button. The button must be a
+        // child of the widget tree (the row's suffix) so it is realized;
+        // libadwaita activates it via mnemonic-activate, which only emits
+        // "clicked" on a realized button.
+        self.ui.file_row.add_suffix(&choose);
         self.ui.file_row.set_activatable_widget(Some(&choose));
 
         {
@@ -246,6 +276,22 @@ impl Window {
             });
         }
 
+        // --- Tray commands -----------------------------------------------------
+        // The indicator runs on a background D-Bus thread; its commands are
+        // forwarded here and executed on the GTK main loop.
+        {
+            let weak = Rc::downgrade(self);
+            glib::MainContext::default().spawn_local(async move {
+                let mut tray_commands = tray_commands;
+                while let Some(command) = tray_commands.next().await {
+                    let Some(this) = weak.upgrade() else {
+                        break;
+                    };
+                    this.on_tray_command(command);
+                }
+            });
+        }
+
         // --- Periodic position/state refresh -----------------------------------
         {
             let weak = Rc::downgrade(self);
@@ -298,15 +344,25 @@ impl Window {
         }
         self.window.add_controller(shortcuts);
 
-        // --- Cleanup when the window goes away -----------------------------------
+        // --- Window close: hide to the indicator instead of quitting -------------
+        // When a status-notifier indicator is present the window closes to the
+        // tray (the app keeps running, playback continues, the icon stays in
+        // the top bar). Without one we fall back to plain quit behaviour.
+        let tray_available = self.tray.is_some();
         let player = self.player.clone();
-        self.window.connect_close_request(move |_| {
-            player.stop();
-            glib::Propagation::Proceed
+        self.window.connect_close_request(move |win| {
+            if tray_available {
+                win.set_visible(false);
+                glib::Propagation::Stop
+            } else {
+                player.stop();
+                glib::Propagation::Proceed
+            }
         });
 
         // Load the library; the empty-state UI is shown until the reply.
         self.database.load();
+        self.refresh_library_list();
         self.update_save_enabled();
         self.refresh_status();
     }
@@ -427,6 +483,7 @@ impl Window {
         self.database.set_last_played(Some(id));
         self.ui.popover.select(Some(id));
         self.refresh_status();
+        self.refresh_tray();
     }
 
     fn on_play_toggled(&self, button: &gtk4::ToggleButton) {
@@ -440,6 +497,7 @@ impl Window {
         }
         self.player.toggle_play_pause();
         self.refresh_status();
+        self.refresh_tray();
     }
 
     fn on_stop(&self) {
@@ -452,6 +510,61 @@ impl Window {
         self.ui.position_scale.set_value(0.0);
         self.refresh_time_label();
         self.refresh_status();
+        self.refresh_tray();
+    }
+
+    /// A command arrived from the status-notifier indicator.
+    fn on_tray_command(&self, command: TrayCommand) {
+        match command {
+            TrayCommand::Play(id) => self.on_entry_activated(id),
+            TrayCommand::TogglePlayPause => self.toggle_play_pause(),
+            TrayCommand::Stop => self.on_stop(),
+            TrayCommand::Open => self.window.present(),
+            TrayCommand::Quit => self.quit(),
+        }
+    }
+
+    /// Toggle play/pause without going through the on-screen button (used by
+    /// the indicator; there is no button to read when the window is hidden).
+    fn toggle_play_pause(&self) {
+        if !self.state.borrow().has_current_uri {
+            return;
+        }
+        self.player.toggle_play_pause();
+        self.refresh();
+        self.refresh_tray();
+    }
+
+    /// Stop playback and quit the whole application (D-Bus + database close
+    /// naturally when every owner is dropped during teardown).
+    fn quit(&self) {
+        self.player.stop();
+        self.app.quit();
+    }
+
+    /// Push the current library + playback state into the indicator menu.
+    fn refresh_tray(&self) {
+        let Some(handle) = &self.tray else {
+            return;
+        };
+        let (status, sync) = {
+            let state = self.state.borrow();
+            let playing = self.player.state() == PlaybackState::Playing;
+            let paused = self.player.state() == PlaybackState::Paused;
+            let status = TrayStatus {
+                entries: state
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.id, entry.title.clone()))
+                    .collect(),
+                playing_id: state.playing_id,
+                playing,
+                paused,
+            };
+            (status, (state.playing_id, playing, paused))
+        };
+        handle.update(|tray| tray.status = status);
+        self.state.borrow_mut().last_tray_sync = Some(sync);
     }
 
     /// The position slider was moved by the user.
@@ -472,7 +585,9 @@ impl Window {
                 self.state.borrow_mut().entries = entries.clone();
                 self.ui.popover.set_entries(&entries, last_played);
                 self.ui.popover.select(self.state.borrow().playing_id);
+                self.refresh_library_list();
                 self.refresh_status();
+                self.refresh_tray();
             }
             Event::Inserted(entry) => {
                 {
@@ -482,6 +597,7 @@ impl Window {
                 self.ui
                     .popover
                     .set_entries(&self.state.borrow().entries, self.state.borrow().playing_id);
+                self.refresh_library_list();
                 self.ui
                     .toast_overlay
                     .add_toast(libadwaita::Toast::new("Audio saved."));
@@ -490,6 +606,7 @@ impl Window {
                 self.ui.file_row.set_subtitle("No file selected");
                 self.ui.file_row.set_tooltip_text(None);
                 self.update_save_enabled();
+                self.refresh_tray();
             }
             Event::Deleted(id) => {
                 {
@@ -504,7 +621,9 @@ impl Window {
                 self.ui
                     .popover
                     .set_entries(&self.state.borrow().entries, self.state.borrow().playing_id);
+                self.refresh_library_list();
                 self.refresh_status();
+                self.refresh_tray();
             }
             Event::Error(message) => {
                 dialogs::show_error(&self.window, "Database error", &message);
@@ -520,10 +639,12 @@ impl Window {
                 self.ui.position_scale.set_value(0.0);
                 self.refresh_time_label();
                 self.refresh_status();
+                self.refresh_tray();
             }
             PlayerEvent::Error(message) => {
                 self.state.borrow_mut().last_duration = 0;
                 self.refresh_status();
+                self.refresh_tray();
                 dialogs::show_error(&self.window, "Playback error", &message);
             }
         }
@@ -576,6 +697,16 @@ impl Window {
             .time_label
             .set_text(&format!("{} / {}", format_time(position), format_time(duration)));
         self.refresh_status();
+
+        // Only rebuild the indicator menu when the playback signature changed.
+        let sync = (
+            self.state.borrow().playing_id,
+            player_state == PlaybackState::Playing,
+            player_state == PlaybackState::Paused,
+        );
+        if self.state.borrow().last_tray_sync != Some(sync) {
+            self.refresh_tray();
+        }
     }
 
     // ------------------------------------------------------------------
@@ -587,6 +718,56 @@ impl Window {
         let ready = !self.ui.title_entry.text().trim().is_empty()
             && self.state.borrow().pending_path.is_some();
         self.ui.save_button.set_sensitive(ready);
+    }
+
+    /// Rebuild the main-window list of saved entries. Each row shows the
+    /// title and the stored path plus a delete button.
+    fn refresh_library_list(&self) {
+        while let Some(child) = self.ui.library_list.first_child() {
+            self.ui.library_list.remove(&child);
+        }
+
+        let entries = self.state.borrow().entries.clone();
+        let database = self.database.clone();
+        for entry in &entries {
+            let row = gtk4::ListBoxRow::new();
+
+            let text_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+            text_box.set_hexpand(true);
+            text_box.set_valign(gtk4::Align::Center);
+
+            let title = gtk4::Label::new(Some(&entry.title));
+            title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            title.set_xalign(0.0);
+
+            let path = gtk4::Label::new(Some(&entry.file_path));
+            path.add_css_class("dim-label");
+            path.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            path.set_xalign(0.0);
+
+            text_box.append(&title);
+            text_box.append(&path);
+
+            let delete = gtk4::Button::from_icon_name("user-trash-symbolic");
+            delete.add_css_class("flat");
+            delete.add_css_class("circular");
+            delete.set_valign(gtk4::Align::Center);
+            delete.set_tooltip_text(Some("Delete"));
+            let id = entry.id;
+            let database = database.clone();
+            delete.connect_clicked(move |_| database.delete(id));
+
+            let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+            row_box.set_margin_top(8);
+            row_box.set_margin_bottom(8);
+            row_box.set_margin_start(8);
+            row_box.set_margin_end(8);
+            row_box.append(&text_box);
+            row_box.append(&delete);
+
+            row.set_child(Some(&row_box));
+            self.ui.library_list.append(&row);
+        }
     }
 
     /// "Ready", "Playing: <title>" or "Paused: <title>".
@@ -642,6 +823,15 @@ fn build_ui(window: &libadwaita::ApplicationWindow) -> Ui {
     form.add(&title_entry);
     form.add(&file_row);
 
+    // --- Saved library ------------------------------------------------------
+    let library_heading = gtk4::Label::new(Some("Library"));
+    library_heading.add_css_class("heading");
+    library_heading.set_halign(gtk4::Align::Start);
+
+    let library_list = gtk4::ListBox::new();
+    library_list.add_css_class("boxed-list");
+    library_list.set_selection_mode(gtk4::SelectionMode::None);
+
     let content = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
     content.set_margin_top(24);
     content.set_margin_bottom(24);
@@ -649,6 +839,8 @@ fn build_ui(window: &libadwaita::ApplicationWindow) -> Ui {
     content.set_margin_end(24);
     content.append(&form);
     content.append(&save_button);
+    content.append(&library_heading);
+    content.append(&library_list);
 
     let clamp = libadwaita::Clamp::new();
     clamp.set_maximum_size(640);
@@ -722,6 +914,7 @@ fn build_ui(window: &libadwaita::ApplicationWindow) -> Ui {
         stop_button,
         toast_overlay,
         popover,
+        library_list,
     }
 }
 

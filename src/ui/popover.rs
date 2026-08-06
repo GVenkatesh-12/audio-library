@@ -86,14 +86,18 @@ impl EntryListPopover {
             self.list.remove(&child);
         }
 
-        let mut rows = self.rows.borrow_mut();
-        rows.clear();
-        *self.entries.borrow_mut() = entries.to_vec();
+        {
+            // Scoped so the `rows` mutable borrow is released before `select`
+            // below tries to re-borrow it (a `RefCell` panic otherwise).
+            let mut rows = self.rows.borrow_mut();
+            rows.clear();
+            *self.entries.borrow_mut() = entries.to_vec();
 
-        for (index, entry) in entries.iter().enumerate() {
-            let row = entry_row(entry, index);
-            self.list.append(&row);
-            rows.push(row);
+            for (index, entry) in entries.iter().enumerate() {
+                let row = entry_row(entry, index);
+                self.list.append(&row);
+                rows.push(row);
+            }
         }
 
         self.stack.set_visible_child_name(if entries.is_empty() {
