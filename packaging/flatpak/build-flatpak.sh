@@ -17,7 +17,7 @@ set -euo pipefail
 FLATPAK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$FLATPAK_DIR/../.." && pwd)"
 APP_ID="org.example.AudioLibrary"
-RUNTIME_VERSION="48"
+RUNTIME_VERSION="50"
 MANIFEST="$FLATPAK_DIR/$APP_ID.yaml"
 ASSETS="$FLATPAK_DIR/assets"
 LOGO_DIR="$FLATPAK_DIR/logo"
