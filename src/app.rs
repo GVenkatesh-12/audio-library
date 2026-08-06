@@ -40,7 +40,17 @@ pub fn run() -> glib::ExitCode {
     // Spawn the status-notifier indicator. If the desktop has no SNI host
     // (e.g. a non-desktop session) the tray simply stays absent and `.ok()`
     // turns that into `None`; the app still runs normally.
-    let tray_handle = LibraryTray::new(command_tx).spawn().ok();
+    //
+    // Inside a Flatpak sandbox the session bus forbids owning arbitrary
+    // well-known names, which ksni needs for its default `StatusNotifierItem-*`
+    // registration. Registering via the connection's unique name instead
+    // keeps the tray icon working there (flatpak sets `FLATPAK_ID`).
+    let tray = LibraryTray::new(command_tx);
+    let tray_handle = if std::env::var("FLATPAK_ID").is_ok() {
+        tray.disable_dbus_name(true).spawn().ok()
+    } else {
+        tray.spawn().ok()
+    };
 
     app.connect_activate(move |app| {
         // SAFETY: we only ever store a valid `Rc<Window>` under this key.

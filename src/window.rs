@@ -635,11 +635,23 @@ impl Window {
     fn on_player_event(&self, event: PlayerEvent) {
         match event {
             PlayerEvent::EndOfStream => {
-                self.state.borrow_mut().last_interaction = None;
+                // Natural end of the track: clear the whole "now playing"
+                // state so the UI (status label, highlighted row, transport
+                // controls, tray menu) resets to the stopped/ready state.
+                {
+                    let mut state = self.state.borrow_mut();
+                    state.playing_id = None;
+                    state.has_current_uri = false;
+                    state.last_duration = 0;
+                    state.last_interaction = None;
+                }
+                self.ui.popover.select(None);
                 self.ui.position_scale.set_value(0.0);
+                self.ui.position_scale.set_range(0.0, 0.0);
                 self.refresh_time_label();
                 self.refresh_status();
                 self.refresh_tray();
+                self.refresh();
             }
             PlayerEvent::Error(message) => {
                 self.state.borrow_mut().last_duration = 0;
