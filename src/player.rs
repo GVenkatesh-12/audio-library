@@ -84,6 +84,7 @@ impl Player {
             .bus()
             .ok_or_else(|| PlayerError::Init("playbin has no bus".into()))?;
         let state_clone = Arc::clone(&state);
+        let playbin_clone = playbin.clone();
         // A bus *watch* must be installed for messages to be dispatched at
         // all: `connect_message` only wires up the `message` signal, which
         // GStreamer emits solely when a watch source pops messages from the
@@ -91,16 +92,24 @@ impl Player {
         // reach this callback (end-of-stream, errors).
         let watch = bus
             .add_watch(move |_bus, message| {
+                // Park the pipeline in `READY` when the stream ends or
+                // fails. GStreamer leaves `playbin` in `PLAYING` after an
+                // end-of-stream, so a later `play_uri`/toggle would be a
+                // skipped PLAYING→PLAYING transition and resume at the end
+                // of the file instead of the beginning.
+                let park = || playbin_clone.set_state(gstreamer::State::Ready);
                 match message.type_() {
                     gstreamer::MessageType::Eos => {
                         *state_clone.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
                             PlaybackState::Stopped;
+                        let _ = park();
                         let _ = events.unbounded_send(PlayerEvent::EndOfStream);
                     }
                     gstreamer::MessageType::Error => {
                         if let gstreamer::MessageView::Error(error) = message.view() {
                             *state_clone.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
                                 PlaybackState::Stopped;
+                            let _ = park();
                             let _ = events
                                 .unbounded_send(PlayerEvent::Error(error.error().to_string()));
                         }
@@ -297,16 +306,17 @@ mod tests {
         assert_eq!(player.duration(), 0);
     }
 
-    #[test]
-    fn end_of_stream_returns_to_stopped_and_emits_event() {
-        init_gstreamer();
-        let wav = std::env::temp_dir().join("audio-library-test-eos.wav");
+    /// Write a minimal mono 16-bit PCM WAV file (3 s tone) into `temp_dir`.
+    fn write_test_wav(name: &str) -> std::path::PathBuf {
+        let wav = std::env::temp_dir().join(name);
         let samples_per_second = 8000u32;
         let seconds = 3u32;
         let samples = (samples_per_second * seconds) as usize;
         let mut data = Vec::with_capacity(samples * 2);
         for i in 0..samples {
-            let value = (8000f32 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / samples_per_second as f32).sin()) as i16;
+            let value = (8000f32
+                * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / samples_per_second as f32).sin())
+                as i16;
             data.extend_from_slice(&value.to_le_bytes());
         }
         // Minimal mono 16-bit PCM WAV file.
@@ -326,6 +336,37 @@ mod tests {
         header.extend_from_slice(&(data.len() as u32).to_le_bytes());
         std::fs::write(&wav, header.into_iter().chain(data).collect::<Vec<_>>())
             .expect("write test wav");
+        wav
+    }
+
+    /// Cycle the GLib main context until `condition` holds or `timeout`
+    /// elapses, draining player events into `events`.
+    fn pump_until(
+        context: &glib::MainContext,
+        receiver: &mut futures_channel::mpsc::UnboundedReceiver<PlayerEvent>,
+        events: &mut Vec<PlayerEvent>,
+        timeout: std::time::Duration,
+        condition: impl FnMut(&[PlayerEvent]) -> bool,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut condition = condition;
+        while std::time::Instant::now() < deadline {
+            while let Ok(event) = receiver.try_recv() {
+                events.push(event);
+            }
+            if condition(events) {
+                return true;
+            }
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        condition(events)
+    }
+
+    #[test]
+    fn end_of_stream_returns_to_stopped_and_emits_event() {
+        init_gstreamer();
+        let wav = write_test_wav("audio-library-test-eos.wav");
         let uri = format!("file://{}", wav.display());
 
         let (sender, mut receiver) = futures_channel::mpsc::unbounded();
@@ -334,25 +375,82 @@ mod tests {
         assert_eq!(player.state(), PlaybackState::Playing);
 
         let context = glib::MainContext::default();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        let mut eos_received = false;
-        while std::time::Instant::now() < deadline {
+        let mut events = Vec::new();
+        let done = pump_until(
+            &context,
+            &mut receiver,
+            &mut events,
+            std::time::Duration::from_secs(15),
+            |events| {
+                matches!(events.last(), Some(PlayerEvent::EndOfStream))
+                    && player.state() == PlaybackState::Stopped
+            },
+        );
+        assert!(done, "EndOfStream event was never emitted");
+        assert_eq!(
+            player.state(),
+            PlaybackState::Stopped,
+            "player must clear its state when the stream ends"
+        );
+    }
+
+    #[test]
+    fn replay_after_end_of_stream_starts_from_the_beginning() {
+        init_gstreamer();
+        let wav = write_test_wav("test-eos-replay.wav");
+        let other_wav = write_test_wav("test-eos-replay-other.wav");
+        let uri = format!("file://{}", wav.display());
+        let other_uri = format!("file://{}", other_wav.display());
+
+        let (sender, mut receiver) = futures_channel::mpsc::unbounded();
+        let player = Player::new(sender).expect("player should initialize");
+        let context = glib::MainContext::default();
+
+        // First play runs to completion.
+        player.play_uri(&uri);
+        assert_eq!(player.state(), PlaybackState::Playing);
+        let mut events = Vec::new();
+        let finished = pump_until(
+            &context,
+            &mut receiver,
+            &mut events,
+            std::time::Duration::from_secs(15),
+            |events| {
+                matches!(events.last(), Some(PlayerEvent::EndOfStream))
+                    && player.state() == PlaybackState::Stopped
+            },
+        );
+        assert!(finished, "first play-through should reach end-of-stream");
+
+        // Switching to a *different* track after an end-of-stream must play
+        // it from the beginning. A buggy player resumes the new stream at
+        // the old stream's end position and posts an (almost) immediate
+        // end-of-stream, so we require the EOS to arrive only after the vast
+        // majority of the 3s track has elapsed.
+        player.play_uri(&other_uri);
+        assert_eq!(player.state(), PlaybackState::Playing);
+        let replay_started = std::time::Instant::now();
+        let mut reached_eos = false;
+        while std::time::Instant::now() < replay_started + std::time::Duration::from_secs(15) {
+            let mut fresh = Vec::new();
             while let Ok(event) = receiver.try_recv() {
-                if matches!(event, PlayerEvent::EndOfStream) {
-                    eos_received = true;
-                }
+                fresh.push(event);
             }
-            if eos_received && player.state() == PlaybackState::Stopped {
+            if fresh
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::EndOfStream))
+            {
+                reached_eos = true;
                 break;
             }
             context.iteration(false);
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert!(eos_received, "EndOfStream event was never emitted");
-        assert_eq!(
-            player.state(),
-            PlaybackState::Stopped,
-            "player must clear its state when the stream ends"
+        assert!(reached_eos, "replayed track should reach end-of-stream");
+        let elapsed = replay_started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1500),
+            "replay raised end-of-stream after {elapsed:?}; the stream did not play again"
         );
     }
 }

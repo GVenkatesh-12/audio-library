@@ -635,17 +635,17 @@ impl Window {
     fn on_player_event(&self, event: PlayerEvent) {
         match event {
             PlayerEvent::EndOfStream => {
-                // Natural end of the track: clear the whole "now playing"
-                // state so the UI (status label, highlighted row, transport
-                // controls, tray menu) resets to the stopped/ready state.
+                // Natural end of the track: the audio stopped, so reset the
+                // position display. The stream stays *loaded* (playing_id /
+                // has_current_uri are kept) so the Play button and the tray
+                // menu can restart it from the beginning.
+                let finished = self.state.borrow().playing_id;
                 {
                     let mut state = self.state.borrow_mut();
-                    state.playing_id = None;
-                    state.has_current_uri = false;
                     state.last_duration = 0;
                     state.last_interaction = None;
                 }
-                self.ui.popover.select(None);
+                self.ui.popover.select(finished);
                 self.ui.position_scale.set_value(0.0);
                 self.ui.position_scale.set_range(0.0, 0.0);
                 self.refresh_time_label();
