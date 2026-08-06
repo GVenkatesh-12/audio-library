@@ -37,7 +37,8 @@ modules:
     # mounted at /usr/lib/sdk/rust-stable but its bin/ is NOT added to the
     # sandbox PATH automatically, so we append it here.
     build-options:
-      network: true
+      build-args:
+        - --share=network
       append-path: /usr/lib/sdk/rust-stable/bin
     build-commands:
       - cargo build --release --locked
