@@ -20,4 +20,3 @@ Thumbs.db
 packaging/flatpak/build/
 packaging/flatpak/src-stage/
 packaging/flatpak/*.flatpak
-packaging/flatpak/assets/audio-library.png

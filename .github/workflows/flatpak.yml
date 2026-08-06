@@ -19,17 +19,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # assets/audio-library.png and src-stage are gitignored build artifacts,
-      # so CI regenerates them the same way the local build script does.
-      - name: Prepare app icon
-        run: |
-          mkdir -p packaging/flatpak/assets
-          if [ -f packaging/flatpak/logo/logo.png ]; then
-            cp packaging/flatpak/logo/logo.png packaging/flatpak/assets/audio-library.png
-          else
-            cp resources/icons/audio-library.png packaging/flatpak/assets/audio-library.png
-          fi
-
+      # src-stage is a gitignored build artifact, so CI regenerates it the
+      # same way the local build script does. The app icon is committed at
+      # packaging/flatpak/assets/audio-library.png (512x512, flatpak max).
       - name: Stage source tree
         run: |
           rm -rf packaging/flatpak/src-stage && mkdir -p packaging/flatpak/src-stage
