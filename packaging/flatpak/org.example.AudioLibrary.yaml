@@ -11,6 +11,10 @@ app-id: org.example.AudioLibrary
 runtime: org.gnome.Platform
 runtime-version: "48"
 sdk: org.gnome.Sdk
+# The GNOME SDK does not ship Rust; the rust-stable extension provides the
+# cargo/rustc toolchain used by the module build.
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
 command: audio-library
 
 finish-args:
