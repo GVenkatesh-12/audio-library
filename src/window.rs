@@ -479,9 +479,14 @@ impl Window {
             state.playing_id = Some(id);
             state.has_current_uri = true;
             state.last_interaction = None;
+            // The new stream's duration is not known yet: reset so the time
+            // label does not briefly show the previous track's length.
+            state.last_duration = 0;
         }
         self.database.set_last_played(Some(id));
         self.ui.popover.select(Some(id));
+        self.ui.position_scale.set_value(0.0);
+        self.refresh_time_label();
         self.refresh_status();
         self.refresh_tray();
     }

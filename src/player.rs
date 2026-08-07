@@ -144,10 +144,16 @@ impl Player {
     }
 
     /// Load a URI and start playing it immediately.
+    ///
+    /// The pipeline is parked in `READY` first: when another track is still
+    /// playing, `playbin` would otherwise skip the `PLAYING → PLAYING`
+    /// transition and keep streaming the old file while only the `uri`
+    /// property changes.
     pub fn play_uri(&self, uri: &str) {
         let Some(playbin) = &self.playbin else {
             return;
         };
+        let _ = playbin.set_state(gstreamer::State::Ready);
         playbin.set_property("uri", uri.to_string());
         if playbin.set_state(gstreamer::State::Playing).is_ok() {
             self.set_state(PlaybackState::Playing);
@@ -306,11 +312,11 @@ mod tests {
         assert_eq!(player.duration(), 0);
     }
 
-    /// Write a minimal mono 16-bit PCM WAV file (3 s tone) into `temp_dir`.
-    fn write_test_wav(name: &str) -> std::path::PathBuf {
+    /// Write a minimal mono 16-bit PCM WAV file (a `seconds`-long tone) into
+    /// `temp_dir`.
+    fn write_test_wav(name: &str, seconds: u32) -> std::path::PathBuf {
         let wav = std::env::temp_dir().join(name);
         let samples_per_second = 8000u32;
-        let seconds = 3u32;
         let samples = (samples_per_second * seconds) as usize;
         let mut data = Vec::with_capacity(samples * 2);
         for i in 0..samples {
@@ -366,7 +372,7 @@ mod tests {
     #[test]
     fn end_of_stream_returns_to_stopped_and_emits_event() {
         init_gstreamer();
-        let wav = write_test_wav("audio-library-test-eos.wav");
+        let wav = write_test_wav("audio-library-test-eos.wav", 3);
         let uri = format!("file://{}", wav.display());
 
         let (sender, mut receiver) = futures_channel::mpsc::unbounded();
@@ -397,8 +403,8 @@ mod tests {
     #[test]
     fn replay_after_end_of_stream_starts_from_the_beginning() {
         init_gstreamer();
-        let wav = write_test_wav("test-eos-replay.wav");
-        let other_wav = write_test_wav("test-eos-replay-other.wav");
+        let wav = write_test_wav("test-eos-replay.wav", 3);
+        let other_wav = write_test_wav("test-eos-replay-other.wav", 3);
         let uri = format!("file://{}", wav.display());
         let other_uri = format!("file://{}", other_wav.display());
 
@@ -451,6 +457,59 @@ mod tests {
         assert!(
             elapsed >= std::time::Duration::from_millis(1500),
             "replay raised end-of-stream after {elapsed:?}; the stream did not play again"
+        );
+    }
+
+    #[test]
+    fn switching_tracks_while_playing_starts_the_new_stream() {
+        init_gstreamer();
+        // Two tracks of different lengths: a short one plays first, then a
+        // longer one is selected *while the short one is still playing*. A
+        // buggy player ignores the mid-playback switch (PLAYING → PLAYING
+        // is skipped) and finishes the old track instead, which ends after
+        // roughly 2s — the new track must instead run its full 3s.
+        let short = write_test_wav("test-switch-short.wav", 2);
+        let long = write_test_wav("test-switch-long.wav", 3);
+        let short_uri = format!("file://{}", short.display());
+        let long_uri = format!("file://{}", long.display());
+
+        let (sender, mut receiver) = futures_channel::mpsc::unbounded();
+        let player = Player::new(sender).expect("player should initialize");
+        let context = glib::MainContext::default();
+
+        player.play_uri(&short_uri);
+        assert_eq!(player.state(), PlaybackState::Playing);
+
+        // Let the short track play partway through before switching.
+        let preroll = std::time::Instant::now();
+        while std::time::Instant::now() < preroll + std::time::Duration::from_millis(700) {
+            while receiver.try_recv().is_ok() {}
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // Switch to the longer track mid-playback.
+        player.play_uri(&long_uri);
+        assert_eq!(player.state(), PlaybackState::Playing);
+        let switch_time = std::time::Instant::now();
+        let mut reached_eos = false;
+        while std::time::Instant::now() < switch_time + std::time::Duration::from_secs(15) {
+            while let Ok(event) = receiver.try_recv() {
+                if matches!(event, PlayerEvent::EndOfStream) {
+                    reached_eos = true;
+                }
+            }
+            if reached_eos {
+                break;
+            }
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(reached_eos, "switched track should reach end-of-stream");
+        let elapsed = switch_time.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(2500),
+            "the new track ended after only {elapsed:?} — the previous stream kept playing"
         );
     }
 }
